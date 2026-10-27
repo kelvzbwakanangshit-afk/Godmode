@@ -11,9 +11,9 @@
  *   !music blinding lights the weeknd
  *
  * Source order:
- *   1. SoundCloud  (audio of the track + link)       <- main source
- *   2. Deezer      (30s preview + link)              <- fallback
- *   3. iTunes      (30s preview + link)              <- fallback
+ *   1. SoundCloud  (FULL song audio + link)          <- only source of full audio
+ *   2. Deezer      (info + link, 30s preview optional)
+ *   3. iTunes      (info + link, 30s preview optional)
  *
  * SoundCloud needs a client_id. Set SOUNDCLOUD_CLIENT_ID (recommended). If it is not set,
  * the bot tries to discover one from soundcloud.com (fragile: it can break whenever
@@ -23,6 +23,7 @@
  *   SOUNDCLOUD_CLIENT_ID   your client id
  *   MUSIC_SEND_AUDIO=0     send info + link only (no audio file)
  *   MUSIC_MAX_MB           max audio size to send (default 24, Messenger limit is 25)
+ *   MUSIC_ALLOW_PREVIEW=0  turn OFF the 30s clip fallback (default: ON)
  */
 
 const fs = require("fs");
@@ -31,6 +32,7 @@ const path = require("path");
 
 const MAX_AUDIO_BYTES = Math.max(1, Math.min(25, Number(process.env.MUSIC_MAX_MB || 24))) * 1024 * 1024;
 const SEND_AUDIO = String(process.env.MUSIC_SEND_AUDIO || "1") !== "0";
+const ALLOW_PREVIEW = String(process.env.MUSIC_ALLOW_PREVIEW || "1") !== "0"; // default ON: 30s clip if no full song
 const UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36";
 
 async function http(url, { ms = 12_000, json = true, text = false } = {}) {
@@ -87,10 +89,11 @@ function score(track, q) {
   return s;
 }
 
-function pickBest(list, q) {
-  const usable = list.filter((t) => t.previewUrl || t.getAudioUrl);
-  if (!usable.length) return null;
-  return usable.map((t) => ({ t, s: score(t, q) })).sort((a, b) => b.s - a.s)[0].t;
+function rank(list, q) {
+  return list
+    .map((t) => ({ t, s: score(t, q) }))
+    .sort((a, b) => b.s - a.s)
+    .map((x) => x.t);
 }
 
 // ---------------------------------------------------------------- SoundCloud
@@ -197,20 +200,26 @@ async function searchItunes(q) {
   }));
 }
 
-async function findTrack(q) {
-  for (const search of [searchSoundcloud, searchDeezer, searchItunes]) {
+async function findTracks(q) {
+  let candidates = [];
+  try {
+    // full songs only: skip snippets (Go+ tracks)
+    candidates = rank((await searchSoundcloud(q)).filter((t) => !t.snippet), q).slice(0, 5);
+  } catch { /* soundcloud down */ }
+
+  // info/link fallback (30s preview only used if MUSIC_ALLOW_PREVIEW=1)
+  let info = null;
+  for (const search of [searchDeezer, searchItunes]) {
     try {
-      const best = pickBest(await search(q), q);
-      if (best) return best;
-    } catch {
-      /* try the next source */
-    }
+      const list = await search(q);
+      if (list.length) { info = rank(list, q)[0]; break; }
+    } catch { /* next */ }
   }
-  return null;
+  return { candidates, info };
 }
 
 // -------------------------------------------------------------------- download
-async function downloadAudio(url, ms = 60_000) {
+async function downloadAudio(url, ms = 120_000) {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), ms);
   try {
@@ -231,39 +240,25 @@ async function downloadAudio(url, ms = 60_000) {
 
 const fmtTime = (s) => (Number.isFinite(s) && s > 0 ? `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}` : null);
 
-/** @returns {Promise<string | {body, attachment, cleanup}>} */
-async function musicCommand(rawArgs, prefix = "!") {
-  const q = parseQuery(rawArgs);
-  if (!q) return `Format: ${prefix}music (title) artist\nHal: ${prefix}music (Blinding Lights) The Weeknd`;
-
-  const track = await findTrack(q);
-  if (!track) return `Walang nahanap para sa "${[q.title, q.artist].filter(Boolean).join(" - ")}" 😅 Subukan mong i-check ang spelling o dagdagan ng artist.`;
-
-  const note = track.preview ? `(30s preview via ${track.source})` : track.snippet ? `(snippet lang · via ${track.source})` : `via ${track.source}`;
-  const lines = [
+function describe(track) {
+  const note = track.getAudioUrl
+    ? `full song · via ${track.source}`
+    : track.preview && ALLOW_PREVIEW && SEND_AUDIO
+    ? `(30s preview via ${track.source})`
+    : `via ${track.source}`;
+  return [
     `🎵 ${track.title}`,
     `👤 ${track.artist || "Unknown artist"}`,
     track.album ? `💿 ${track.album}` : null,
     fmtTime(track.durationS) ? `⏱ ${fmtTime(track.durationS)}` : null,
     track.link ? `🔗 ${track.link}` : null,
     note,
-  ].filter(Boolean);
-  const body = lines.join("\n");
+  ].filter(Boolean).join("\n");
+}
 
-  if (!SEND_AUDIO) return body;
-
-  let file = null;
-  try {
-    const url = track.previewUrl || (await track.getAudioUrl());
-    file = await downloadAudio(url);
-  } catch (e) {
-    const why = /too big|bad audio size/.test(String(e && e.message)) ? "Masyadong malaki ang audio para sa Messenger" : "Hindi ma-download ang audio ngayon";
-    return `${body}\n⚠️ ${why}, i-click na lang ang link.`;
-  }
-
+function asAttachment(body, file) {
   const stream = fs.createReadStream(file);
   stream.on("error", () => {}); // e.g. file removed before it was read; never crash the bot over a track
-
   return {
     body,
     attachment: stream,
@@ -272,6 +267,38 @@ async function musicCommand(rawArgs, prefix = "!") {
       fs.unlink(file, () => {});
     },
   };
+}
+
+/** @returns {Promise<string | {body, attachment, cleanup}>} */
+async function musicCommand(rawArgs, prefix = "!") {
+  const q = parseQuery(rawArgs);
+  if (!q) return `Format: ${prefix}music (title) artist\nHal: ${prefix}music (Blinding Lights) The Weeknd`;
+
+  const { candidates, info } = await findTracks(q);
+  if (!candidates.length && !info)
+    return `Walang nahanap para sa "${[q.title, q.artist].filter(Boolean).join(" - ")}" 😅 Subukan mong i-check ang spelling o dagdagan ng artist.`;
+
+  if (SEND_AUDIO) {
+    // 1) full song from SoundCloud: try each candidate until one downloads (skips too-big / broken ones)
+    for (const track of candidates) {
+      try {
+        const file = await downloadAudio(await track.getAudioUrl());
+        return asAttachment(describe(track), file);
+      } catch { /* next candidate */ }
+    }
+
+    // 2) optional 30s preview fallback
+    if (ALLOW_PREVIEW && info && info.previewUrl) {
+      try {
+        const file = await downloadAudio(info.previewUrl);
+        return asAttachment(describe(info), file);
+      } catch { /* fall through to link only */ }
+    }
+  }
+
+  const t = info || candidates[0];
+  const why = SEND_AUDIO ? "Walang makuhang buong audio (o masyadong malaki para sa Messenger)" : "Naka-off ang pag-send ng audio";
+  return `${describe(t)}\n⚠️ ${why}, i-click na lang ang link.`;
 }
 
 module.exports = { musicCommand, parseQuery };
