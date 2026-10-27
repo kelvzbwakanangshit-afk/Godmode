@@ -118,12 +118,15 @@ function prepareBanatReply(threadID, message, incomingText = "", options = {}) {
 }
 
 function react(api, emoji, messageID, threadID) {
-  if (!api || !emoji || !messageID) return;
+  if (!api || !emoji || !messageID || !threadID) return;
   try {
     if (typeof api.setMessageReactionMqtt === "function") {
-      api.setMessageReactionMqtt(emoji, String(messageID), String(threadID), () => {});
+      const r = api.setMessageReactionMqtt(emoji, String(messageID), String(threadID), () => {});
+      if (r && typeof r.catch === "function") r.catch(() => {});
     } else if (typeof api.setMessageReaction === "function") {
-      api.setMessageReaction(emoji, String(messageID), () => {}, true);
+      // fca signature: (reaction, messageID, threadID, callback, forceCustomReaction)
+      const r = api.setMessageReaction(emoji, String(messageID), String(threadID), () => {}, true);
+      if (r && typeof r.catch === "function") r.catch(() => {});
     }
   } catch (_) {
     /* reactions are cosmetic; never let them break a reply */
@@ -167,20 +170,7 @@ function sendBanatReplyWithTyping(api, message, threadID, replyToMessageID = nul
 
   const selfReact =
     dependencies.selfReact === false ? null : dependencies.selfReact || { rate: 1 };
-  const incomingReact = dependencies.incomingReact || null;
-
-  // React to the incoming message while "reading" it, before typing starts.
-  if (incomingReact && incomingReact.messageID) {
-    scheduleReaction(
-      api,
-      incomingReact,
-      DEFAULT_INCOMING_REACTIONS,
-      incomingReact.messageID,
-      threadID,
-      120,
-      Math.max(200, Math.min(900, delay))
-    );
-  }
+  // Self reactions only: the bot never reacts to other people's messages.
 
   return new Promise((resolve) => {
     setTimeout(() => {
