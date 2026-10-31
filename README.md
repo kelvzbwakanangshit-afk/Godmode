@@ -3,7 +3,7 @@
 Troll bot na may pagka-assistant para sa Facebook Messenger. Lahat ng file ay nasa **root** (walang subfolder).
 
 - Humanized na troll replies (`replies.json`) na may **working typing indicator**
-- `!music (title) artist` — info + 30s audio preview + link
+- `!m [title] by [artist]` — info + 30s audio preview + link
 - **GC name cycle** na hindi titigil hangga't hindi mo pinapatay
 - Assistant commands: `!ask`, `!weather`, `!calc`, `!define`, `!time`, `!remind`, `!roll`, `!8ball`, `!pick`...
 - Auto-reconnect, auto-save ng cookie, auto-resume pag nag-restart ang server
@@ -34,7 +34,7 @@ Kung walang `FCA_PACKAGE`, `@dongdev/fca-unofficial` ang gagamitin. Makikita sa 
 
 | Command | Ginagawa |
 |---|---|
-| `!music (title) artist` | Info + audio (SoundCloud) + link. Gumagana rin: `title - artist`, `title \| artist`, `title by artist`, o title lang |
+| `!m [title] by [artist]` | Buong kanta (SoundCloud lang) + info + link. Strict: kapag hindi sigurado ang match, walang isesend. Alias: `!music`, `!song`. Gumagana rin: `(title) artist`, `title - artist`, `title \| artist`, `title by artist`, o title lang |
 | `!ask <tanong>` | Sagot ni Claude (kailangan ng `ANTHROPIC_API_KEY`; model: `ASSISTANT_MODEL`, default `claude-haiku-5-5`) |
 | `!weather <lugar>` | Panahon (Open-Meteo, walang key) |
 | `!calc <math>` | `+ - * / % ^ ( )` (walang eval) |
@@ -108,3 +108,30 @@ Ang lumang `human-typing.js` ay hindi napapatay ang indicator (walang `sendTypin
 - **Ang GC name cycle ay nagpo-post ng "X named the group Y" sa bawat palit.** Mas mabilis ang interval, mas maingay at mas mataas ang tsansang ma-flag. Para sa mahabang buhay ng account, gumamit ng 45s pataas.
 - Ang troll replies ay may limits (skip rate, cooldown, hourly/daily cap, quiet hours). Ang commands ay may hiwalay na cooldown (4s kada tao, 150/oras).
 - Labag sa Terms ng Facebook ang unofficial automation; may risk na ma-restrict o ma-lock ang account. Gumamit ng account na kaya mong mawala.
+
+
+## Economy / Shop / Moderation (GoatBot-style)
+
+| Command | Gamit |
+|---|---|
+| `!balance` `!daily` `!work` `!bet` `!deposit` `!withdraw` `!give` `!top` | Economy (wallet + bank) |
+| `!slot <amt>` · `!cf heads\|tails <amt>` · `!rob @tao` | Laro: slot, coinflip, nakawan (30 min cooldown) |
+| `!shop` · `!item <#>` · `!buy <#> [dami]` · `!sell <item>` · `!inv` | Shop (may Laptop at Padlock na) |
+| `!kick @tao` · `!ban @tao [dahilan]` · `!unban <#\|@tao>` · `!banlist` | Moderation. Naka-ban = ikikick ulit kapag in-add, at ignored ang commands niya |
+| `!warn @tao [dahilan]` · `!warns [@tao]` · `!unwarn @tao [all]` | 3 warnings = auto kick |
+| `!unsend` (i-reply sa mensahe ng bot) · `!mods` | Burahin ang mensahe ng bot / admin list ng GC |
+| `!additem Pizza \| 150 \| 🍕 \| Masarap \| 10` · `!edititem <#> price\|name\|emoji\|desc\|max <value>` · `!delitem <#>` | **Owner lang.** Dagdag/edit/tanggal ng item sa shop (emoji, desc, max optional). Naka-save sa `economy.json`. Kapag tinanggal, nire-refund ng 50% ang may-ari. Custom items lang ang puwedeng i-edit/tanggalin |
+| `!setbal @tao <amt> [wallet\|bank]` | **Owner lang.** Puwede ring i-reply ang mensahe nila, o `!setbal 5000` para sa sarili. Tumatanggap ng `5k`, `1m` |
+
+- Moderation commands: admin ng GC o admin ng bot ang puwede. **Dapat admin ang bot account sa GC** para gumana ang kick/ban.
+- Owner = bot account + `OWNER_IDS` (env, comma-separated) + `cfg.owners`. Kung walang `OWNER_IDS`, ang mga admin (`ADMIN_IDS`) ang owner.
+- Saved sa `economy.json` at `moderation.json` (ilagay ang `DATA_DIR` sa Railway Volume).
+
+
+## Dashboard bilang offline web app (PWA)
+
+- Buksan ang dashboard sa browser, tapos **Install app** (Chrome/Edge/Android) o **Share → Add to Home Screen** (iPhone Safari). Magiging app icon na ito.
+- Kahit walang internet, mabubuksan ang dashboard at makikita ang **huling status** na na-save sa device. Hindi gagana ang mga button (Start/Stop, settings) hangga't walang koneksyon sa server; kusa itong magre-refresh pagbalik ng internet.
+- Hindi kailanman nasa cache ang `/api/*` (live data at password). Ang page, icons, at font lang ang naka-cache.
+- Mga bagong file: `manifest.webmanifest`, `sw.js`, `icon.svg`, `icon-192.png`, `icon-512.png`, `icon-maskable-512.png`, `apple-touch-icon.png`. Ilagay ang lahat sa tabi ng `server.js`.
+- Kung babaguhin mo ang listahan ng naka-cache na files sa `sw.js`, palitan ang `VERSION` doon.
