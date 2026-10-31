@@ -1,29 +1,26 @@
 "use strict";
 
 /**
- * !music <title> [artist]
+ * !m <title> by <artist>      (also: !music, !song)
+ *
+ * Single source: SoundCloud -> sends the FULL song (audio file) + link.
+ * Strict matching: if the title/artist does not match for sure, NOTHING is sent
+ * ("walang nahanap") instead of sending a wrong song.
  *
  * Accepted formats:
+ *   !m Blinding Lights by The Weeknd
  *   !music (Blinding Lights) The Weeknd
  *   !music Blinding Lights - The Weeknd
  *   !music Blinding Lights | The Weeknd
- *   !music Blinding Lights by The Weeknd
- *   !music blinding lights the weeknd
- *
- * Source order:
- *   1. SoundCloud  (FULL song audio + link)          <- only source of full audio
- *   2. Deezer      (info + link, 30s preview optional)
- *   3. iTunes      (info + link, 30s preview optional)
+ *   !music Blinding Lights            (title only: exact title match required)
  *
  * SoundCloud needs a client_id. Set SOUNDCLOUD_CLIENT_ID (recommended). If it is not set,
- * the bot tries to discover one from soundcloud.com (fragile: it can break whenever
- * SoundCloud changes its site; the fallbacks then take over).
+ * the bot tries to discover one from soundcloud.com (fragile: can break when SoundCloud changes its site).
  *
  * Env:
  *   SOUNDCLOUD_CLIENT_ID   your client id
  *   MUSIC_SEND_AUDIO=0     send info + link only (no audio file)
  *   MUSIC_MAX_MB           max audio size to send (default 24, Messenger limit is 25)
- *   MUSIC_ALLOW_PREVIEW=0  turn OFF the 30s clip fallback (default: ON)
  */
 
 const fs = require("fs");
@@ -32,7 +29,8 @@ const path = require("path");
 
 const MAX_AUDIO_BYTES = Math.max(1, Math.min(25, Number(process.env.MUSIC_MAX_MB || 24))) * 1024 * 1024;
 const SEND_AUDIO = String(process.env.MUSIC_SEND_AUDIO || "1") !== "0";
-const ALLOW_PREVIEW = String(process.env.MUSIC_ALLOW_PREVIEW || "1") !== "0"; // default ON: 30s clip if no full song
+const MIN_FULL_S = 60;        // shorter than this = snippet/preview, never a full song
+const MAX_FULL_S = 12 * 60;   // longer than this = mix/podcast, not the song
 const UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36";
 
 async function http(url, { ms = 12_000, json = true, text = false } = {}) {
@@ -54,7 +52,11 @@ function parseQuery(raw) {
   let m = text.match(/^\(([^)]+)\)\s*(.*)$/); // (title) artist
   if (m) return { title: m[1].trim(), artist: m[2].trim() };
 
-  m = text.match(/^(.+?)\s+(?:-|–|—|\||by)\s+(.+)$/i); // title - artist
+  m = text.match(/^(.+?)\s+(?:-|–|—|\|)\s+(.+)$/); // title - artist
+  if (m) return { title: m[1].trim(), artist: m[2].trim() };
+
+  // title by artist: split at the LAST " by " so "Stand By Me by Ben E. King" works
+  m = text.match(/^(.+)\s+by\s+(.+)$/i);
   if (m) return { title: m[1].trim(), artist: m[2].trim() };
 
   return { title: text, artist: "" };
@@ -64,36 +66,69 @@ const norm = (s) =>
   String(s || "")
     .toLowerCase()
     .normalize("NFKD")
-    .replace(/[̀-ͯ]/g, "")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/&/g, " and ")
     .replace(/[^a-z0-9 ]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 
-function score(track, q) {
-  const title = norm(track.title);
-  const artist = norm(track.artist);
-  const both = `${title} ${artist}`;
+const padded = (s) => ` ${norm(s)} `;
+const hasPhrase = (hay, needle) => !!norm(needle) && padded(hay).includes(padded(needle));
+
+// words that do not change which song it is
+const NOISE = new Set(["official", "audio", "video", "music", "lyrics", "lyric", "hd", "hq", "full", "song", "version", "visualizer", "mv", "m", "v", "feat", "ft", "featuring", "prod", "the", "a", "and", "of"]);
+// words that mean it is a DIFFERENT version of the song
+const VERSION_RE = /\b(karaoke|tribute|cover|instrumental|acoustic|8d|nightcore|sped up|speed up|slowed|reverb|remix|mashup|bass boosted|live|demo|piano version|loop|extended|rework|bootleg|edit|flip|vip|lofi|lo fi|type beat|reaction|parody|preview|snippet|teaser|clip)\b/i;
+
+/**
+ * Strict check. Returns a score (> 0) if this track is surely the requested song, otherwise 0.
+ */
+function matchScore(t, q) {
   const wantTitle = norm(q.title);
   const wantArtist = norm(q.artist);
-  let s = 0;
+  if (!wantTitle) return 0;
+
+  const title = norm(t.title);
+  const artist = norm(t.artist);
+  const uploader = norm(t.uploader);
+  const hay = `${title} ${artist} ${uploader}`;
+
+  // 1. title must appear as whole words in the track title
+  if (!hasPhrase(title, wantTitle)) return 0;
+
+  // 2. artist (if given) must appear in title / artist / uploader as whole words
+  if (wantArtist && !hasPhrase(hay, wantArtist)) return 0;
+
+  // 3. no remix / cover / live / karaoke... unless the user asked for it
+  if (VERSION_RE.test(`${t.title} ${t.album || ""}`) && !VERSION_RE.test(`${q.title} ${q.artist}`)) return 0;
+
+  // 4. duration must look like a full song
+  if (t.snippet) return 0;
+  if (Number.isFinite(t.durationS) && (t.durationS < MIN_FULL_S || t.durationS > MAX_FULL_S)) return 0;
+
+  // 5. what is left of the track title (besides title / artist / noise) must be small:
+  //    "Blinding Lights (Official Audio)" ok, "Blinding Lights Mix by DJ Something" not
+  const known = new Set([...wantTitle.split(" "), ...wantArtist.split(" "), ...artist.split(" "), ...uploader.split(" ")]);
+  const extra = title.split(" ").filter((w) => w && !known.has(w) && !NOISE.has(w));
+  if (extra.length > 2) return 0;
+
+  // title-only query: require the title to be (almost) exactly the song title
+  if (!wantArtist && extra.length > 0) return 0;
+
+  let s = 10;
   if (title === wantTitle) s += 6;
-  else if (title.includes(wantTitle) || wantTitle.includes(title)) s += 3;
-  if (wantArtist) {
-    if (artist === wantArtist) s += 6;
-    else if (artist.includes(wantArtist) || wantArtist.includes(artist)) s += 4;
-    else if (both.includes(wantArtist)) s += 3; // SoundCloud often puts the artist in the title
-  } else if (both.includes(wantTitle)) s += 1;
-  if (/karaoke|tribute|cover|instrumental|8d|nightcore|sped up|slowed|reverb|remix|bass boosted/i.test(`${track.title} ${track.album || ""}`) &&
-      !/karaoke|tribute|cover|instrumental|8d|nightcore|sped up|slowed|reverb|remix|bass boosted/i.test(`${q.title} ${q.artist}`)) s -= 5;
-  if (track.official) s += 1;
+  else if (title === `${wantArtist} ${wantTitle}` || title === `${wantTitle} ${wantArtist}`) s += 6;
+  if (wantArtist && artist === wantArtist) s += 4;
+  if (t.official) s += 4;
+  if (t.hasProgressive) s += 3;              // can be sent as an audio file
+  s += Math.min(3, Math.log10((t.plays || 0) + 1) / 2);   // popular upload wins ties
+  s -= extra.length * 0.5;
   return s;
 }
 
-function rank(list, q) {
-  return list
-    .map((t) => ({ t, s: score(t, q) }))
-    .sort((a, b) => b.s - a.s)
-    .map((x) => x.t);
+function pickBest(list, q) {
+  const ranked = list.map((t) => ({ t, s: matchScore(t, q) })).filter((x) => x.s > 0).sort((a, b) => b.s - a.s);
+  return ranked.length ? ranked[0].t : null;
 }
 
 // ---------------------------------------------------------------- SoundCloud
@@ -129,24 +164,27 @@ async function scGet(buildUrl) {
   }
 }
 
-async function searchSoundcloud(q) {
-  const term = `${q.title} ${q.artist}`.trim();
+async function searchSoundcloudTerm(term) {
   const data = await scGet((id) =>
-    `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(term)}&limit=20&client_id=${id}`
+    `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(term)}&limit=30&client_id=${id}`
   );
   return (Array.isArray(data.collection) ? data.collection : [])
     .filter((x) => x && x.streamable !== false && x.media && Array.isArray(x.media.transcodings))
     .map((x) => {
       const prog = x.media.transcodings.find((t) => t.format && t.format.protocol === "progressive");
+      const ms = x.full_duration || x.duration;
       return {
         title: x.title,
         artist: (x.publisher_metadata && x.publisher_metadata.artist) || (x.user && x.user.username),
+        uploader: x.user && x.user.username,
         album: x.publisher_metadata && x.publisher_metadata.album_title,
-        durationS: x.full_duration ? Math.round(x.full_duration / 1000) : x.duration ? Math.round(x.duration / 1000) : null,
+        durationS: ms ? Math.round(ms / 1000) : null,
         link: x.permalink_url,
         source: "SoundCloud",
-        snippet: x.policy === "SNIP", // Go+ track: SoundCloud only serves a short snippet
+        snippet: x.policy === "SNIP",            // Go+ track: SoundCloud only serves a short snippet
         official: !!(x.user && x.user.verified),
+        plays: x.playback_count || 0,
+        hasProgressive: !!prog,
         getAudioUrl: prog
           ? async () => {
               const r = await scGet((id) =>
@@ -158,68 +196,22 @@ async function searchSoundcloud(q) {
             }
           : null,
       };
-    })
-    .filter((t) => t.getAudioUrl);
+    });
 }
 
-// -------------------------------------------------------------------- Deezer / iTunes
-async function searchDeezer(q) {
-  const query = q.artist ? `artist:"${q.artist}" track:"${q.title}"` : q.title;
-  let data = await http(`https://api.deezer.com/search?limit=15&q=${encodeURIComponent(query)}`);
-  let items = Array.isArray(data.data) ? data.data : [];
-  if (!items.length && q.artist) {
-    data = await http(`https://api.deezer.com/search?limit=15&q=${encodeURIComponent(`${q.title} ${q.artist}`)}`);
-    items = Array.isArray(data.data) ? data.data : [];
+/** Only source: SoundCloud. Tries "title artist" first, then title alone (artist is often just the uploader name). */
+async function findTrack(q) {
+  const terms = [`${q.title} ${q.artist}`.trim()];
+  if (q.artist) terms.push(q.title);
+  for (const term of terms) {
+    const best = pickBest(await searchSoundcloudTerm(term), q);
+    if (best) return best;
   }
-  return items.map((x) => ({
-    title: x.title,
-    artist: x.artist && x.artist.name,
-    album: x.album && x.album.title,
-    durationS: x.duration,
-    previewUrl: x.preview,
-    link: x.link,
-    source: "Deezer",
-    preview: true,
-  }));
-}
-
-async function searchItunes(q) {
-  const term = `${q.title} ${q.artist}`.trim();
-  const data = await http(
-    `https://itunes.apple.com/search?media=music&entity=song&limit=15&term=${encodeURIComponent(term)}`
-  );
-  return (Array.isArray(data.results) ? data.results : []).map((x) => ({
-    title: x.trackName,
-    artist: x.artistName,
-    album: x.collectionName,
-    durationS: x.trackTimeMillis ? Math.round(x.trackTimeMillis / 1000) : null,
-    previewUrl: x.previewUrl,
-    link: x.trackViewUrl,
-    source: "Apple Music",
-    preview: true,
-  }));
-}
-
-async function findTracks(q) {
-  let candidates = [];
-  try {
-    // full songs only: skip snippets (Go+ tracks)
-    candidates = rank((await searchSoundcloud(q)).filter((t) => !t.snippet), q).slice(0, 5);
-  } catch { /* soundcloud down */ }
-
-  // info/link fallback (30s preview only used if MUSIC_ALLOW_PREVIEW=1)
-  let info = null;
-  for (const search of [searchDeezer, searchItunes]) {
-    try {
-      const list = await search(q);
-      if (list.length) { info = rank(list, q)[0]; break; }
-    } catch { /* next */ }
-  }
-  return { candidates, info };
+  return null;
 }
 
 // -------------------------------------------------------------------- download
-async function downloadAudio(url, ms = 120_000) {
+async function downloadAudio(url, ms = 60_000) {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), ms);
   try {
@@ -240,25 +232,48 @@ async function downloadAudio(url, ms = 120_000) {
 
 const fmtTime = (s) => (Number.isFinite(s) && s > 0 ? `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}` : null);
 
-function describe(track) {
-  const note = track.getAudioUrl
-    ? `full song · via ${track.source}`
-    : track.preview && ALLOW_PREVIEW && SEND_AUDIO
-    ? `(30s preview via ${track.source})`
-    : `via ${track.source}`;
-  return [
+/** @returns {Promise<string | {body, attachment, cleanup}>} */
+async function musicCommand(rawArgs, prefix = "!") {
+  const q = parseQuery(rawArgs);
+  if (!q) return `Format: ${prefix}m [title] by [artist]\nHal: ${prefix}m Blinding Lights by The Weeknd`;
+
+  let track = null;
+  try {
+    track = await findTrack(q);
+    if (!track && q.artist) {
+      // the split may have been wrong (e.g. "Stand by Me"): retry with the whole text as the title
+      track = await findTrack({ title: String(rawArgs).trim(), artist: "" });
+    }
+  } catch {
+    return "Hindi ma-reach ang SoundCloud ngayon 😭 subukan ulit mamaya.";
+  }
+  if (!track) {
+    return `Walang eksaktong nahanap para sa "${[q.title, q.artist].filter(Boolean).join(" by ")}" 😅\nPara hindi ako magpadala ng maling kanta, wala akong isinend. I-check ang spelling o ilagay ang artist: ${prefix}m [title] by [artist]`;
+  }
+
+  const lines = [
     `🎵 ${track.title}`,
     `👤 ${track.artist || "Unknown artist"}`,
     track.album ? `💿 ${track.album}` : null,
     fmtTime(track.durationS) ? `⏱ ${fmtTime(track.durationS)}` : null,
     track.link ? `🔗 ${track.link}` : null,
-    note,
-  ].filter(Boolean).join("\n");
-}
+  ].filter(Boolean);
+  const body = lines.join("\n");
 
-function asAttachment(body, file) {
+  if (!SEND_AUDIO) return body;
+  if (!track.getAudioUrl) return `${body}\n⚠️ Hindi maibigay ng SoundCloud ang audio file nito, i-click na lang ang link.`;
+
+  let file = null;
+  try {
+    file = await downloadAudio(await track.getAudioUrl());
+  } catch (e) {
+    const why = /too big|bad audio size/.test(String(e && e.message)) ? "Masyadong malaki ang audio para sa Messenger" : "Hindi ma-download ang audio ngayon";
+    return `${body}\n⚠️ ${why}, i-click na lang ang link.`;
+  }
+
   const stream = fs.createReadStream(file);
-  stream.on("error", () => {}); // e.g. file removed before it was read; never crash the bot over a track
+  stream.on("error", () => {}); // never crash the bot over a track
+
   return {
     body,
     attachment: stream,
@@ -269,36 +284,4 @@ function asAttachment(body, file) {
   };
 }
 
-/** @returns {Promise<string | {body, attachment, cleanup}>} */
-async function musicCommand(rawArgs, prefix = "!") {
-  const q = parseQuery(rawArgs);
-  if (!q) return `Format: ${prefix}music (title) artist\nHal: ${prefix}music (Blinding Lights) The Weeknd`;
-
-  const { candidates, info } = await findTracks(q);
-  if (!candidates.length && !info)
-    return `Walang nahanap para sa "${[q.title, q.artist].filter(Boolean).join(" - ")}" 😅 Subukan mong i-check ang spelling o dagdagan ng artist.`;
-
-  if (SEND_AUDIO) {
-    // 1) full song from SoundCloud: try each candidate until one downloads (skips too-big / broken ones)
-    for (const track of candidates) {
-      try {
-        const file = await downloadAudio(await track.getAudioUrl());
-        return asAttachment(describe(track), file);
-      } catch { /* next candidate */ }
-    }
-
-    // 2) optional 30s preview fallback
-    if (ALLOW_PREVIEW && info && info.previewUrl) {
-      try {
-        const file = await downloadAudio(info.previewUrl);
-        return asAttachment(describe(info), file);
-      } catch { /* fall through to link only */ }
-    }
-  }
-
-  const t = info || candidates[0];
-  const why = SEND_AUDIO ? "Walang makuhang buong audio (o masyadong malaki para sa Messenger)" : "Naka-off ang pag-send ng audio";
-  return `${describe(t)}\n⚠️ ${why}, i-click na lang ang link.`;
-}
-
-module.exports = { musicCommand, parseQuery };
+module.exports = { musicCommand, parseQuery, matchScore, pickBest };
