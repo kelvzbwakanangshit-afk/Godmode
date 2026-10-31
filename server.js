@@ -13,6 +13,7 @@ const { startTyping, stopTyping, stopAllTyping } = require("./human-typing");
 const { createGcCycle } = require("./gcname");
 const commands = require("./commands");
 const economy = require("./economy");
+const moderation = require("./moderation");
 
 const PORT = process.env.PORT || 3000;
 const DATA = process.env.DATA_DIR || __dirname; // everything lives in the project root by default
@@ -76,6 +77,16 @@ const save = () => { try { writeAtomic(CFG_FILE, cfg); } catch (e) { console.err
 
 const envAdmins = new Set(String(process.env.ADMIN_IDS || "").split(",").map((s) => s.trim()).filter(Boolean));
 const isAdminId = (id) => String(id) === S.uid || envAdmins.has(String(id)) || (cfg.admins || []).map(String).includes(String(id));
+
+// Owner = the bot account + OWNER_IDS (env, comma-separated) + cfg.owners.
+// If no extra owner is set at all, the admins count as owners (so !setbal works out of the box).
+const envOwners = new Set(String(process.env.OWNER_IDS || "").split(",").map((s) => s.trim()).filter(Boolean));
+const isOwnerId = (id) => {
+  const cfgOwners = (cfg.owners || []).map(String);
+  if (String(id) === S.uid || envOwners.has(String(id)) || cfgOwners.includes(String(id))) return true;
+  return !envOwners.size && !cfgOwners.length && isAdminId(id);
+};
+moderation.init(DATA, (who, msg) => console.log(`[${who}] ${msg}`), { isAdminId, isOwnerId });
 
 // ---------- reply pools (replies.json: array OR { type: [..], default: [..] }) ----------
 const RAW_POOL = JSON.parse(fs.readFileSync(path.join(__dirname, "replies.json"), "utf8"));
@@ -356,6 +367,9 @@ async function handleCommand(ev, parsed) {
   if (!cmd) return;
   const admin = isAdminId(ev.senderID);
   if (cmd.admin && !admin) return;
+  const owner = isOwnerId(ev.senderID);
+  if (cmd.owner && !owner) return;
+  if (!admin && moderation.isBanned(ev.threadID, ev.senderID)) return;   // banned in this GC: commands ignored
 
   if (!admin) {                                      // public users: only in the target chat, rate limited
     if (!S.running || !isTarget(ev)) return;
@@ -376,7 +390,7 @@ async function handleCommand(ev, parsed) {
   startTyping(api, ev.threadID);                     // "typing..." while the command works (music search, !ask...)
   let reply;
   try {
-    reply = await cmd.run({ args: parsed.args, ev, cfg, save, gc, S, prefix: cfg.prefix, isAdmin: admin });
+    reply = await cmd.run({ args: parsed.args, ev, cfg, save, gc, S, prefix: cfg.prefix, isAdmin: admin, isOwner: owner });
   } catch (e) {
     log("error", `cmd ${parsed.name}: ${e && e.message || e}`);
     reply = "May error sa command na yan 😭 subukan ulit mamaya.";
@@ -392,6 +406,10 @@ async function handleCommand(ev, parsed) {
 }
 
 async function onEvent(ev) {
+  if (ev && ev.type === "event") {                   // someone joined / left: re-kick banned people
+    if (S.api) await moderation.onEvent(S.api, ev, { S, isTarget }).catch(() => {});
+    return;
+  }
   if (!ev || (ev.type !== "message" && ev.type !== "message_reply") || !ev.body) return;
 
   const parsed = commands.parse(ev.body, cfg.prefix || "!");
@@ -458,7 +476,20 @@ async function startBot() {
 const app = express();
 app.set("trust proxy", 1);
 app.use(express.json({ limit: "1mb" }));
-app.get("/", (q, r) => r.sendFile(path.join(__dirname, "index.html")));   // only index.html is public
+app.get("/", (q, r) => r.sendFile(path.join(__dirname, "index.html")));   // only index.html (+ the app files below) are public
+// Offline / installable web app: manifest, service worker, icons. Nothing else is served.
+const PWA_FILES = {
+  "/manifest.webmanifest": "application/manifest+json", "/sw.js": "application/javascript",
+  "/icon.svg": "image/svg+xml", "/icon-192.png": "image/png", "/icon-512.png": "image/png",
+  "/icon-maskable-512.png": "image/png", "/apple-touch-icon.png": "image/png",
+};
+for (const [route, type] of Object.entries(PWA_FILES)) {
+  app.get(route, (q, r) => {
+    r.type(type);
+    if (route === "/sw.js") r.set("Cache-Control", "no-cache");           // browser re-checks the worker on every visit
+    r.sendFile(path.join(__dirname, route.slice(1)), (err) => { if (err && !r.headersSent) r.status(404).end(); });
+  });
+}
 app.get("/health", (q, r) => r.json({ ok: true }));
 
 app.get("/api/needsetup", (q, r) => r.json({ setup: false, open: !hasAdmin() }));
@@ -567,6 +598,6 @@ app.get("/api/threads", (q, r) => {
 // freshest cookie when the host (Railway) sends SIGTERM on redeploy.
 process.on("uncaughtException", (e) => log("fatal", (e && e.stack) || e));
 process.on("unhandledRejection", (e) => log("fatal", (e && e.stack) || e));
-for (const sig of ["SIGTERM", "SIGINT"]) process.on(sig, () => { economy.flush(); stopAllTyping(); captureState("shutdown"); save(); process.exit(0); });
+for (const sig of ["SIGTERM", "SIGINT"]) process.on(sig, () => { economy.flush(); moderation.flush(); stopAllTyping(); captureState("shutdown"); save(); process.exit(0); });
 
 app.listen(PORT, () => { log("system", "server on " + PORT); if (cfg.appState) connect(); });
