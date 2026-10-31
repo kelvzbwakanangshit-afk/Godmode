@@ -7,12 +7,16 @@
  *   ctx = { args, ev, cfg, save, gc, S, prefix, isAdmin }
  *
  * Public:  help music time weather define calc roll flip 8ball pick remind ask uptime
+ * Economy: balance daily work bet slot cf rob give deposit withdraw shop buy sell inv top
+ * Mod:     kick ban unban banlist warn warns unwarn unsend mods   (GC admins + bot admins)
+ * Owner:   setbal additem edititem delitem
  * Admin:   gcname troll
  * "Admin" = the bot account itself, or an ID listed in cfg.admins / ADMIN_IDS.
  */
 
 const { musicCommand } = require("./music");
 const economy = require("./economy");
+const moderation = require("./moderation");
 
 async function getJson(url, ms = 10_000, init = {}) {
   const ctl = new AbortController();
@@ -187,10 +191,10 @@ const pickOne = (a) => a[Math.floor(Math.random() * a.length)];
 // ---------- registry ----------
 const COMMANDS = {
   help: {
-    run: async ({ prefix, isAdmin }) =>
+    run: async ({ prefix, isAdmin, isOwner }) =>
       [
         "🤖 Troll Assistant",
-        `${prefix}music (title) artist — audio + info`,
+        `${prefix}m [title] by [artist] — audio + info`,
         `${prefix}ask <tanong> — sagot ni AI`,
         `${prefix}weather <lugar>`,
         `${prefix}calc <math>`,
@@ -202,7 +206,11 @@ const COMMANDS = {
         `${prefix}uptime · ${prefix}owner`,
         `\n💰 Economy: ${prefix}balance · ${prefix}daily · ${prefix}work · ${prefix}bet <amt>`,
         `${prefix}deposit/${prefix}withdraw <amt|all> · ${prefix}give @tao <amt> · ${prefix}top`,
-        `🛒 ${prefix}shop · ${prefix}buy <#> · ${prefix}sell <item> · ${prefix}inv`,
+        `🎰 ${prefix}slot <amt> · ${prefix}cf heads|tails <amt> · ${prefix}rob @tao`,
+        `🛒 Shop: ${prefix}shop · ${prefix}item <#> · ${prefix}buy <#> [dami] · ${prefix}sell <item> · ${prefix}inv`,
+        `\n🛡 Mod (admin ng GC): ${prefix}kick @tao · ${prefix}ban @tao [dahilan] · ${prefix}unban <#|@tao> · ${prefix}banlist`,
+        `${prefix}warn @tao [dahilan] · ${prefix}warns [@tao] · ${prefix}unwarn @tao [all] · ${prefix}unsend (reply) · ${prefix}mods`,
+        isOwner ? `\n👑 Owner: ${prefix}setbal @tao <amt> [wallet|bank]\n${prefix}additem <name> | <presyo> | [emoji] | [desc] | [max] · ${prefix}edititem <#> price|name|emoji|desc|max <value> · ${prefix}delitem <#>` : null,
         isAdmin ? `🔒 ${prefix}on / ${prefix}off — buksan/patayin ang bot sa GC na ito` : null,
         isAdmin ? `🔒 Eco: ${prefix}eco add|remove|reset @tao [amt]` : null,
         isAdmin ? `\n🔒 Admin: ${prefix}gcname start|stop|status|list|add|remove|set|interval|now · ${prefix}troll on|off` : null,
@@ -211,6 +219,7 @@ const COMMANDS = {
 
   music: { run: async ({ args, prefix }) => musicCommand(args, prefix) },
   song: { alias: "music" },
+  m: { alias: "music" },
 
   ask: {
     run: async ({ args, prefix }) => (args ? ask(args) : `Format: ${prefix}ask <tanong mo>`),
@@ -384,6 +393,7 @@ const COMMANDS = {
 };
 
 Object.assign(COMMANDS, economy.commands); // coins, bank, shop
+Object.assign(COMMANDS, moderation.commands); // kick, ban, warn...
 
 function resolve(name) {
   let cmd = COMMANDS[name];
